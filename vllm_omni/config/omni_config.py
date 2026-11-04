@@ -876,8 +876,8 @@ class _DiffusionConfigProjection(_TrackExplicitConfigFields):
     fa_deterministic: bool = False
     vae_use_slicing: bool = False
     vae_use_tiling: bool = False
-    vae_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
-    vae_encode_fast_path: Literal["off", "lossless", "channels_last"] = "lossless"
+    vae_fast_path: Literal["off", "lossless", "channels_last", "cudnn"] = "lossless"
+    vae_encode_fast_path: Literal["off", "lossless", "channels_last", "cudnn"] = "lossless"
     mask_strategy_file_path: str | None = None
     skip_time_steps: int = 15
     VSA_sparsity: float = 0.0

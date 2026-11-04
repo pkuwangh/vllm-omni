@@ -9,17 +9,17 @@ the channels in registers and write the normalized (and optionally SiLU'd)
 result: the activation is read once and written once instead of the two-pass
 scheme :mod:`vllm_omni.diffusion.layers.vae_norm_epilogue` needs for channels-first layouts.
 
-This kernel is only dispatched at the tolerance-based ``channels_last`` level,
+This kernel serves the tolerance-based ``channels_last`` and ``cudnn`` levels,
 so for FP16/FP32 it uses fast math: one reciprocal per position, ``scale`` folded into
 ``gamma``, the approximate ``exp`` and divide for SiLU, and a single rounding
 to the activation dtype at the end. The bit-exact epilogue sequence (IEEE
 ``div_rn`` twice, libdevice ``exp``, six intermediate roundings) measured
 ALU-bound at 1.6 TB/s on the 512-channel stage.
 
-The encoder opts into ``exact_bf16`` for BF16: it retains the reference
+The encoder and cuDNN adapter opt into ``exact_bf16`` for BF16: it retains the reference
 epilogue's intermediate roundings, because removing them accumulates excessive
-posterior drift across the encoder's normalization layers. The decoder keeps
-the fast math above for every dtype.
+drift across normalization layers. The existing ``channels_last`` decoder
+keeps the fast math above for every dtype.
 
 The kernel can also absorb the bias of the convolution that produced ``x``:
 ``WanResidualBlock.conv1`` feeds only ``norm2``, so at this level the
@@ -134,7 +134,7 @@ def rms_norm_channels_last(
 
     ``bias`` is an optional per-channel vector (the un-added bias of the
     convolution that produced ``x``); ``None`` skips the add. ``exact_bf16``
-    keeps the reference epilogue's roundings for BF16 (encoder only).
+    keeps the reference epilogue's roundings for BF16.
     """
     if not HAS_TRITON or not on_kernel_device(x) or x.dtype not in _SUPPORTED_DTYPES:
         return None

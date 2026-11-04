@@ -1000,34 +1000,40 @@ def test_cached_conv_chunk_loop_matches_reference_including_mixed_paths(
             assert torch.equal(out, ref), pattern
 
 
-def _first_frame_test_conv(dtype: torch.dtype, **kwargs) -> WanCausalConv3d:
+def _first_frame_test_conv(dtype: torch.dtype, channels: tuple[int, int] = (16, 32), **kwargs) -> WanCausalConv3d:
     options = dict(kernel_size=3, padding=1)
     options.update(kwargs)
-    conv = WanCausalConv3d(16, 32, **options).eval().to(device=DEVICE, dtype=dtype)
+    conv = WanCausalConv3d(*channels, **options).eval().to(device=DEVICE, dtype=dtype)
     conv.to(memory_format=torch.channels_last_3d)
     setattr(conv, fp.CFG_ATTR, fp.FastPathConfig(channels_last=True))
     return conv
 
 
 @torch.no_grad()
-@pytest.mark.parametrize("dtype", ALL_DTYPES)
+@pytest.mark.parametrize(
+    "dtype,channels",
+    [(dtype, (16, 32)) for dtype in ALL_DTYPES]
+    + [(torch.float32, channels) for channels in ((160, 160), (384, 384), (512, 512))],
+)
 @pytest.mark.parametrize("temporal_only", [False, True])
 @pytest.mark.parametrize("start", [None, "Rep"])
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_only, start, monkeypatch) -> None:
+def test_first_frame_convolution_preserves_following_cached_frame(
+    dtype, channels, temporal_only, start, monkeypatch
+) -> None:
     torch.manual_seed(19)
     kwargs = dict(kernel_size=(3, 1, 1), padding=(1, 0, 0)) if temporal_only else {}
-    conv = _first_frame_test_conv(dtype, **kwargs)
-    chunks = [_dense_5d((2, 16, 1, 7, 11), dtype, True) for _ in range(2)]
+    conv = _first_frame_test_conv(dtype, channels=channels, **kwargs)
+    chunks = [_dense_5d((2, channels[0], 1, 7, 11), dtype, True) for _ in range(2)]
     calls = []
-    original = fp._first_frame_conv2d
+    original = fp._first_frame_convolution
 
     def spy(*args):
         pair = original(*args)
         calls.append(pair is not None)
         return pair
 
-    monkeypatch.setattr(fp, "_first_frame_conv2d", spy)
+    monkeypatch.setattr(fp, "_first_frame_convolution", spy)
     cache = [start]
     reference_cache = None
     # Disable TF32 so the FP32 comparison isolates Conv2d/Conv3d accumulation.
@@ -1048,15 +1054,16 @@ def test_first_frame_conv2d_preserves_following_cached_frame(dtype, temporal_onl
 @torch.no_grad()
 @pytest.mark.parametrize("dtype", LOW_PRECISION)
 @pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("channels", [(16, 32), (384, 384)])
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> None:
+def test_first_frame_convolution_deferred_bias_matches_autocast(dtype, with_bias, channels) -> None:
     torch.manual_seed(20)
-    conv = _first_frame_test_conv(torch.float32)
+    conv = _first_frame_test_conv(torch.float32, channels=channels)
     if with_bias:
         conv.bias.copy_(torch.randn_like(conv.bias))
     else:
         conv.register_parameter("bias", None)
-    x = _dense_5d((1, 16, 1, 7, 11), torch.float32, True)
+    x = _dense_5d((1, channels[0], 1, 7, 11), torch.float32, True)
     cache = [None]
     with torch.autocast(DEVICE, dtype=dtype):
         expected = WanCausalConv3d.forward(conv, x)
@@ -1075,6 +1082,23 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
 
 
 @torch.no_grad()
+@pytest.mark.parametrize("groups,stride,padding,dilation", [(1, (1, 1), (1, 1), (1, 1)), (2, (2, 1), (2, 1), (2, 1))])
+@pytest.mark.parametrize("autocast_dtype", [None, torch.bfloat16, torch.float16])
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+def test_spatial_convolution_preserves_geometry_and_autocast(groups, stride, padding, dilation, autocast_dtype):
+    torch.manual_seed(21)
+    x = torch.randn(2, 8, 13, 17, device=DEVICE).contiguous(memory_format=torch.channels_last)
+    weight = torch.randn(12, 8 // groups, 3, 3, device=DEVICE) * 0.1
+    bias = torch.randn(12, device=DEVICE)
+    with torch.backends.cudnn.flags(allow_tf32=False):
+        with torch.autocast(DEVICE, dtype=autocast_dtype or torch.bfloat16, enabled=autocast_dtype is not None):
+            expected = F.conv2d(x, weight, bias, stride, padding, dilation, groups)
+            actual = fp._spatial_convolution(x, weight, bias, stride, padding, dilation, groups)
+    assert actual.dtype == expected.dtype
+    torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+
+
+@torch.no_grad()
 @pytest.mark.parametrize(
     "case,kwargs",
     [
@@ -1088,7 +1112,7 @@ def test_first_frame_conv2d_deferred_bias_matches_autocast(dtype, with_bias) -> 
     ],
 )
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
+def test_first_frame_convolution_declines_unsupported_calls(case, kwargs) -> None:
     conv = _first_frame_test_conv(torch.float32, **kwargs)
     if case == "lossless":
         setattr(conv, fp.CFG_ATTR, fp.FastPathConfig())
@@ -1098,7 +1122,7 @@ def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
         conv.groups = 2
         conv.weight = nn.Parameter(conv.weight[:, :8].contiguous(memory_format=torch.channels_last_3d))
     x = _dense_5d((1, 16, 2 if case == "multiframe" else 1, 7, 11), torch.float32, True)
-    assert fp._first_frame_conv2d(conv, x, conv.bias) is None
+    assert fp._first_frame_convolution(conv, x, conv.bias) is None
     expected = WanCausalConv3d.forward(conv, x)
     actual = fp._run_cached_causal_conv(conv, x, [None], 0)
     assert _bits_equal(actual, expected), "Declined inputs must keep the existing exact fallback"
@@ -1107,16 +1131,16 @@ def test_first_frame_conv2d_declines_unsupported_calls(case, kwargs) -> None:
 @torch.no_grad()
 @pytest.mark.parametrize("attribute,value", [("padding_mode", "reflect"), ("padding", (0, 1, 1))])
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_first_frame_conv2d_declines_nonzero_native_padding(attribute, value) -> None:
+def test_first_frame_convolution_declines_nonzero_native_padding(attribute, value) -> None:
     conv = _first_frame_test_conv(torch.float32)
     setattr(conv, attribute, value)
     x = _dense_5d((1, 16, 1, 7, 11), torch.float32, True)
-    assert fp._first_frame_conv2d(conv, x, conv.bias) is None
+    assert fp._first_frame_convolution(conv, x, conv.bias) is None
 
 
 @torch.no_grad()
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_first_frame_conv2d_uses_reloaded_weights() -> None:
+def test_first_frame_convolution_uses_reloaded_weights() -> None:
     torch.manual_seed(21)
     conv = _first_frame_test_conv(torch.bfloat16)
     x = _dense_5d((1, 16, 1, 7, 11), torch.bfloat16, True)

@@ -36,6 +36,7 @@ import os
 import statistics
 import time
 from collections.abc import Iterable
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -48,6 +49,7 @@ from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
 from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import (
     VAE_FAST_PATH_LEVELS,
     install_wan_vae_fastpath,
+    uninstall_wan_vae_fastpath,
 )
 
 TINY_CONFIG = dict(
@@ -78,7 +80,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size", default="1280x720", help="Output video WxH")
     parser.add_argument("--frames", type=int, default=189, help="Output frame count (1 + 4k)")
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
-    parser.add_argument("--fast-path", default=",".join(VAE_FAST_PATH_LEVELS), help="Comma-separated levels")
+    parser.add_argument("--fast-path", default="off,lossless,channels_last", help="Comma-separated levels")
+    parser.add_argument(
+        "--tf32", choices=("on", "off"), default="on", help="convolution TF32 permission for all candidates"
+    )
+    parser.add_argument("--json", help="Save timings, startup, memory and accuracy metrics")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
     parser.add_argument("--tiling", action="store_true", help="Decode with the VAE's spatial tiling (single GPU)")
@@ -227,10 +233,21 @@ def run_level(
     *,
     rank: int,
     parallel: bool,
+    vae: OmniAutoencoderKLWan,
 ) -> tuple[torch.Tensor, dict]:
-    vae = load_vae(args, dtype, device, parallel)
+    sync()
+    start = time.perf_counter()
     report = install_wan_vae_fastpath(vae, level=level)
+    sync()
+    install_s = time.perf_counter() - start
+    if level != "off" and not report.installed:
+        raise RuntimeError(f"{level} installation failed: {report.reason}")
     latents = make_latents(vae, args, dtype, device)
+    start = time.perf_counter()
+    decode(vae, latents)
+    sync()
+    first_decode_s = time.perf_counter() - start
+    packed_bytes = sum(b.numel() * b.element_size() for n, b in vae.named_buffers() if "_wan_cudnn_weight" in n)
     for _ in range(args.warmup):
         decode(vae, latents)
     sync()
@@ -247,6 +264,9 @@ def run_level(
     if dist.is_initialized():
         dist.all_reduce(peak, op=dist.ReduceOp.MAX)  # the largest rank decides whether the config fits
     stats = {
+        "install_s": install_s,
+        "first_decode_s": first_decode_s,
+        "packed_weight_bytes": packed_bytes,
         "installed": report.installed,
         "reason": report.reason,
         "fused_silu": report.fused_silu_dtypes,
@@ -260,9 +280,8 @@ def run_level(
             print(f"[{level}] profile")
         profile_decode(vae, latents, args.profile_rows, verbose=rank == 0)
     assert output is not None
-    del vae
-    torch.accelerator.empty_cache()
-    return output.detach(), stats
+    uninstall_wan_vae_fastpath(vae)
+    return output.detach().cpu(), stats
 
 
 @torch.inference_mode()
@@ -283,7 +302,7 @@ def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, devic
         if saved.shape != latents.shape:
             raise ValueError(f"Saved latent shape {saved.shape} does not match {latents.shape}")
         latents = saved.to(device=device, dtype=dtype).contiguous()
-    helpers = {"baseline": lambda conv, x, bias: None, "candidate": forwards._first_frame_conv2d}
+    helpers = {"baseline": lambda conv, x, bias: None, "candidate": forwards._first_frame_convolution}
     optimized_calls = 0
 
     def counted(conv, x, bias):
@@ -292,7 +311,7 @@ def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, devic
         optimized_calls += result is not None
         return result
 
-    with patch.object(forwards, "_first_frame_conv2d", counted):
+    with patch.object(forwards, "_first_frame_convolution", counted):
         decode(vae, latents)
         sync()
     if optimized_calls == 0:
@@ -301,14 +320,14 @@ def run_first_frame_ablation(args: argparse.Namespace, dtype: torch.dtype, devic
     outputs: dict[str, list[torch.Tensor]] = {arm: [] for arm in helpers}
     for _ in range(args.warmup):
         for helper in helpers.values():
-            with patch.object(forwards, "_first_frame_conv2d", helper):
+            with patch.object(forwards, "_first_frame_convolution", helper):
                 decode(vae, latents)
                 sync()
     for iteration in range(args.iters):
         # Alternating AB and BA pairs give ABBA order without dropping odd runs.
         arms = ("baseline", "candidate") if iteration % 2 == 0 else ("candidate", "baseline")
         for arm in arms:
-            with patch.object(forwards, "_first_frame_conv2d", helpers[arm]):
+            with patch.object(forwards, "_first_frame_convolution", helpers[arm]):
                 sync()
                 torch.accelerator.reset_peak_memory_stats()
                 start = time.perf_counter()
@@ -372,6 +391,8 @@ def main() -> None:
         )
     device = torch.device(accelerator.type, torch.accelerator.current_device_index())
     dtype = DTYPES[args.dtype]
+    torch.backends.cudnn.allow_tf32 = args.tf32 == "on"
+    torch.backends.cuda.matmul.allow_tf32 = False
     if args.first_frame_ablation:
         if world_size != 1 or parallel:
             raise SystemExit("--first-frame-ablation requires one GPU")
@@ -393,9 +414,12 @@ def main() -> None:
         )
     golden = None
     baseline_time = None
+    results = {}
+    failed = False
+    vae = load_vae(args, dtype, device, parallel)
     try:
         for level in levels:
-            output, stats = run_level(args, level, dtype, device, rank=rank, parallel=parallel)
+            output, stats = run_level(args, level, dtype, device, rank=rank, parallel=parallel, vae=vae)
             if level == "off":
                 golden = output
                 baseline_time = stats["time_s"]
@@ -407,6 +431,21 @@ def main() -> None:
                 # ranks just keep the collectives in lockstep.
                 del output
                 continue
+            difference = output.float() - golden.float()
+            stats["accuracy"] = {
+                "finite": bool(output.isfinite().all()),
+                "max_abs": difference.abs().max().item(),
+                "rms_abs": difference.square().mean().sqrt().item(),
+                "psnr_db": psnr(output, golden),
+                "allclose": torch.allclose(output, golden, atol=1e-4, rtol=1e-4),
+            }
+            if level == "cudnn":
+                passed = stats["accuracy"]["finite"] and stats["accuracy"]["psnr_db"] >= 50
+                if args.dtype == "fp32" and args.tf32 == "off":
+                    passed = passed and stats["accuracy"]["allclose"]
+                stats["passed"] = passed
+                failed |= not passed
+            results[level] = stats
             speedup = baseline_time / stats["time_s"] if baseline_time else float("nan")
             times = stats["times_s"]
             line = (
@@ -426,10 +465,18 @@ def main() -> None:
                     line += f"  fused_silu={stats['fused_silu'] or 'off'}"
                 else:
                     line += f"  reason={stats['reason']}"
+            if level == "cudnn":
+                line += f"  validation={'PASS' if stats['passed'] else 'FAIL'}"
             print(line)
             print(f"[{level:13s}] raw_ms " + json.dumps([round(t * 1e3, 1) for t in times]))
             del output
             torch.accelerator.empty_cache()
+        if args.json and rank == 0:
+            Path(args.json).write_text(
+                json.dumps({"args": vars(args), "torch": torch.__version__, "results": results}, indent=2)
+            )
+        if failed:
+            raise SystemExit("cuDNN decoder accuracy validation failed")
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()

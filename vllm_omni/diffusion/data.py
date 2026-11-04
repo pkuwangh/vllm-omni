@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 # Accepted values for ``OmniDiffusionConfig.vae_fast_path``.
-VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last", "cudnn")
 
 
 def _move_diffusion_alias(

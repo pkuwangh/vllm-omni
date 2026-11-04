@@ -8,7 +8,9 @@ activation through memory several times per layer (normalization, activation,
 causal padding, feature-cache bookkeeping, shortcut upsampling). vLLM-Omni
 installs a fast path on every loaded Wan VAE that fuses this data movement into
 a handful of Triton kernels. The opt-in `channels_last` level also specializes
-first-frame convolutions that have no history.
+first-frame convolutions that have no history. Strict FP32 runs spatial convolutions, including first-frame shortcuts, as
+one-plane native Conv3D with channels-first operands and channels-last output.
+This avoids the oversized Conv2D FFT workspaces without width-specific rules.
 
 ## Decoder levels
 
@@ -19,13 +21,14 @@ The fast path is controlled by `--vae-fast-path` (engine argument
 | --- | --- | --- | --- |
 | `lossless` | yes | bit-identical | Fused RMSNorm epilogue, fused causal-conv input assembly and cache refresh, fused shortcut upsampling and residual adds (with the neighbouring convolution biases folded in), single-pass nearest 2x upsampling, preallocated output assembly. |
 | `channels_last` | no | within tolerance (PSNR typically > 60 dB) | Everything in `lossless`, plus channels-last convolution weights, a single-pass channels-last RMSNorm+SiLU kernel that also absorbs the preceding `conv1` bias, and Conv2d for supported single-frame causal convolutions without history. |
+| `cudnn` | no | within model tolerance | Blackwell cuDNN Conv3D fused with normalization, SiLU, causal padding and history refresh at supported residual blocks. Uses channels-last for the remaining operations. |
 | `off` | no | bit-identical | Reference diffusers decoder. |
 
 ```bash
 # Default: bit-exact fast path
 vllm serve nvidia/Cosmos3-Nano --omni
 
-# Fastest: channels-last decoder (not bit-exact)
+# Channels-last decoder
 vllm serve nvidia/Cosmos3-Nano --omni --vae-fast-path channels_last
 
 # Reference implementation, e.g. to bisect a quality issue
@@ -49,9 +52,9 @@ stages:
 - Installation is skipped, with a logged reason, if a custom forward wrapper
   or forward hook would be replaced or bypassed by the fused paths. Wrappers
   and hooks on modules that the fast path still calls normally are preserved.
-- Every fused kernel validates its inputs and falls back to the exact PyTorch
-  expression for anything it does not support (unusual dtypes or layouts, CPU
-  tensors, autograd enabled, `torch.compile` tracing).
+- The Triton fast paths fall back to PyTorch for unsupported inputs, autograd
+  and `torch.compile` tracing. The `cudnn` level uses registered custom operators
+  during compilation; its supported hardware and dtypes are listed below.
 - The SiLU activation is folded into the normalization kernel only after an
   exhaustive self-test over all bf16/fp16 values proves the fused epilogue
   bit-identical to `F.silu` on the running toolkit; otherwise SiLU stays a
@@ -65,10 +68,12 @@ stages:
 - `channels_last` also skips internal decoder bitwise padding checks to reduce
   first-decode peak memory. Lossless decoding retains all of its checks.
 - For a supported causal convolution with one input frame and no history,
-  the temporal input is `[0, 0, x]`. The `channels_last` level uses Conv2d with
-  the last temporal weight slice, preserving the convolution formula for
-  finite inputs and the existing cache update. Calls with history retain
-  Conv3d. The weight slice is taken on each call, so weight updates and device
+  the temporal input is `[0, 0, x]`. The `channels_last` level convolves
+  only the last temporal weight slice, preserving the convolution formula for
+  finite inputs and the existing cache update. Strict FP32 uses one-plane Conv3D;
+  other arithmetic modes use Conv2D. Calls with history retain full Conv3D. BF16 convolutions with 512 or more output channels and Wan 2.1 latent input (C16→C384) also retain
+  Conv3d because Conv2d rounding errors amplify through decoding. The weight slice is taken
+  on each call, so weight updates and device
   moves do not leave a stale packed copy.
 - For VAEs kept in fp32, cuDNN's channels-last convolution algorithms run in
   TF32 under PyTorch's default `torch.backends.cudnn.allow_tf32 = True`, which
@@ -83,12 +88,13 @@ The engine/deploy-config field is `vae_encode_fast_path`. The supported target
 is Cosmos3's residual Wan2.2 VAE: 2x2 patchification, 4x temporal compression,
 16x spatial compression, and four residual downsampling stages. The real
 Cosmos3 encoder uses 160/320/640 channels and produces 48 latent channels.
-Other Wan architectures retain their reference encoding path.
+The `cudnn` level also supports the non-residual Wan 2.1 encoder. Other architectures retain their reference encoding path.
 
 | Encoder level | Default | Behavior |
 | --- | --- | --- |
 | `lossless` | yes | Reuses the exact normalization epilogue, causal input/cache assembly and bias/residual fusions. Fuses spatial pad/input assembly and temporal downsampling cache copies. Keeps the reference shortcut averaging reduction. |
 | `channels_last` | no | Also converts encoder convolution weights to channels-last, uses single-pass normalization and fuses shortcut averaging with residual addition. Outputs can differ in the last bits. |
+| `cudnn` | no | cuDNN residual-block fusions for Wan 2.1 and Wan 2.2 on Blackwell, with channels-last convolution weights. |
 | `off` | no | Reference encoding. |
 
 For eligible cached encoder convolutions, normalization/SiLU writes directly
@@ -98,9 +104,9 @@ Already-normalized history is copied unchanged; missing history stays zero.
 and only folds SiLU for dtypes that pass the installation-time exactness probe.
 `channels_last` retains its existing single-pass normalization math, except
 that for BF16 the encoder keeps the reference's intermediate roundings (the
-decoder keeps fast math); this fusion does not change its quality gates. Unsupported layouts, non-identity or hooked
+`channels_last` decoder keeps fast math; `cudnn` preserves BF16 roundings); this fusion does not change its quality gates. Unsupported layouts, non-identity or hooked
 dropout, and rejected spatial-padding probes use the existing separate path.
-This fusion is encoder-only; decoder dispatch is unchanged.
+This Triton fusion is encoder-only. The `cudnn` level also fuses decoder stages.
 
 Untiled encoding patchifies one temporal chunk at a time and writes encoder
 features into a preallocated buffer. The schedule remains one initial frame,
@@ -129,7 +135,9 @@ stages:
 Encoder installation has independent reports and rollback/uninstall state.
 It preserves weights and parameter names, and rejects custom forwards or hooks
 that a fusion would bypass. A substituted `RMSNormVAE` keeps its own forward
-and numerical semantics. Autograd and compilation use PyTorch fallbacks. The
+and numerical semantics. Autograd uses PyTorch fallbacks. During compilation,
+`cudnn` preserves its library calls as custom operators; the other levels use
+PyTorch fallbacks. The
 encoder can coexist with spatial-sharded decoding, since the two installers
 modify different modules; spatial tiling remains the encoder's parallel mode.
 
@@ -174,19 +182,15 @@ measurements must use real weights. `--tf32 off` controls FP32 convolution math.
 The profiler reports CUDA operator times, including padding, copying,
 normalization, reduction, attention and convolutions.
 
-Power- and thermally-limited GPUs (for example H100 NVL, RTX 5090 and RTX PRO
-6000) run the same kernels more than 2x slower after sustained load, so timing
-the levels one after another favors whichever level runs first. The default
-`--schedule interleaved` keeps every level's VAE resident and runs one encode
-per level in each warmup and timed round, rotating the first level from round
-to round. Peak memory excludes the other levels' resident weights.
-`--schedule sequential` loads and times one level at a time, for GPUs that
-cannot hold all levels at once. During timed encodes, NVML samples the SM
-clock, power, temperature and clock-event (throttle) reasons every
-`--telemetry-interval-ms` (default 50; 0 disables). They are reported per level
-and per iteration. The console warns when median SM clocks differ by more than
-3% across levels or when the GPU throttled. `--lock-sm-clock-mhz` pins the SM
-clock for the run and resets it on exit; this requires administrator rights.
+The default `--schedule sequential` warms and times one level at a time.
+Consecutive samples let each implementation reach its own sustained power/clock
+state. `--schedule interleaved` keeps all VAEs resident and rotates levels;
+rotation balances positions but can carry predecessor power states into samples.
+Peak memory excludes other levels' resident weights in that mode.
+During timed encodes, NVML samples clocks, power, temperature and clock-event
+reasons every `--telemetry-interval-ms` (default 50; 0 disables). The console
+reports clock differences and throttling. `--lock-sm-clock-mhz` pins the SM
+clock and resets it on exit; this requires administrator rights.
 
 ```bash
 # Comparable timings on a power-limited GPU (clock lock needs root)
@@ -195,8 +199,8 @@ python benchmarks/diffusion/bench_wan_vae_encode.py \
 ```
 
 The benchmark exits unsuccessfully for a lossless bitwise mismatch, nonfinite
-outputs, or channels-last normalized RMSE above 1% for posterior parameters,
-mean or log-variance. `--check-reconstruction` also requires at least 50 dB PSNR
+outputs, or channels-last/cuDNN normalized RMSE above 2% for BF16 and 1%
+for FP32 posterior parameters, mean or log-variance. `--check-reconstruction` also requires at least 50 dB PSNR
 between reconstructions of the reference and candidate mean, using the same
 reference decoder. These are validation gates, not measured encoder results.
 Single-GPU OOM cases are recorded explicitly; distributed failures terminate
@@ -265,3 +269,63 @@ the decode is timed across all ranks and rank 0 reports:
 torchrun --nproc-per-node 2 benchmarks/diffusion/bench_wan_vae_decode.py --model nvidia/Cosmos3-Nano \
     --vae-patch-parallel-size 2 --vae-parallel-mode tile
 ```
+
+## cuDNN kernels on Blackwell
+
+Select `--vae-fast-path cudnn` and/or `--vae-encode-fast-path cudnn` independently.
+The default remains `lossless`. The optional provider requires SM100/SM103,
+CUTLASS DSL 4.9 (including 4.9.0a0) or newer, and a cuDNN frontend build containing the Wan 2.1/TF32
+Conv3D post-ops extension (development revision `df4c5671`). The existing
+`cudnn-bsa` extra alone does not supply this extension.
+
+BF16 uses custom convolution/post-operation fusions where supported. FP32
+with `torch.backends.cudnn.allow_tf32=True` uses explicitly permitted TF32
+convolutions. With TF32 disabled, convolution remains in native cuDNN and
+FP32 normalization/SiLU/padding uses the library post-operation kernel.
+Unsupported channel pairs keep native convolution; FP16 and other GPU
+architectures decline installation with a reason.
+
+Wan 2.2 encoding uses the library causal C12 input convolution and fuses
+across residual blocks within each downsampling
+stage. Wan 2.1 encoding groups its flat residual/downsample sequence the same
+way. A convolution can prepare the next block's normalized input, and the
+last convolution writes the spatial downsampler's padded input. C640 stages
+combine deferred bias/residual additions with the next normalization. C640
+TF32 uses native convolution; BF16 retains the custom convolution. Decoder
+upsampling stages in both Wan versions carry prepared inputs across residual
+blocks. TF32
+fuses C160 normalization while C160 residual preparation and C320 preparation
+use separate post-operation kernels; C96/C192 TF32 residual preparation
+also remains separate, and C256 TF32 remains native. The decoder
+uses explicit native input padding and a library-fused output normalization,
+SiLU, padding and history update, matching the e2e demo. Remaining BF16 norms
+preserve the reference intermediate roundings.
+
+Feature histories remain in the ordinary Wan cache slots. The adapter fills
+caller-owned history regions before using fused padded outputs. Packed weights
+are nonpersistent derived buffers: `load_state_dict` and module device/dtype
+moves invalidate them; ordinary parameters also detect in-place changes.
+Inference tensors have no version counter, so update those weights through
+`load_state_dict`. Custom operators preserve library calls under
+`torch.compile`; lazy weight preparation is outside compiled regions.
+
+Benchmark both implementations with matching precision:
+
+```bash
+python benchmarks/diffusion/bench_wan_vae_encode.py --model MODEL \
+    --size 832x480 --frames 17 --dtype bf16 \
+    --fast-path off,channels_last,cudnn --warmup 1 --iters 3 --json encode.json
+python benchmarks/diffusion/bench_wan_vae_decode.py --model MODEL \
+    --size 832x480 --frames 17 --dtype fp32 --tf32 on \
+    --fast-path off,channels_last,cudnn --warmup 1 --iters 3 --json decode.json
+```
+
+Wan 2.1 encoding currently compares `off,cudnn`; the existing `channels_last`
+encoder installer targets the residual Wan 2.2 architecture. Decoder validation
+for `cudnn` checks finite output and PSNR >= 50 dB against the matching reference;
+strict FP32 additionally checks `atol=rtol=1e-4`. Startup and packed-weight
+memory are recorded separately from steady decode time.
+
+For image-conditioned generation, approximate encoding can change the denoising
+trajectory. Keep `--vae-encode-fast-path lossless` and select the decoder level
+independently when preserving the reference conditioning is important.

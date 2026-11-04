@@ -931,25 +931,25 @@ class OmniServeCommand(CLISubcommand):
         )
         omni_config_group.add_argument(
             "--vae-fast-path",
-            choices=("off", "lossless", "channels_last"),
+            choices=("off", "lossless", "channels_last", "cudnn"),
             default="lossless",
             help=(
                 "Wan VAE decoder fast path. 'lossless' (default) installs bit-exact fused kernels; "
                 "'channels_last' additionally switches decoder convolutions to channels-last memory "
                 "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
-                "diffusers implementation."
+                "diffusers implementation. 'cudnn' selects Blackwell cuDNN Conv3D/post-op fusions."
             ),
         )
 
         omni_config_group.add_argument(
             "--vae-encode-fast-path",
-            choices=("off", "lossless", "channels_last"),
+            choices=("off", "lossless", "channels_last", "cudnn"),
             default="lossless",
             help=(
-                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "Wan VAE encoder fast path, independent of --vae-fast-path. "
                 "'lossless' (default) preserves reference values; 'channels_last' also switches "
                 "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
-                "the reference encoder."
+                "the reference encoder. 'cudnn' supports Wan 2.1/2.2 on Blackwell."
             ),
         )
 

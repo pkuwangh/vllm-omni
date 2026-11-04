@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Independent fast paths for the diffusers Wan causal video VAE.
 
 ``install_wan_vae_fastpath(vae, level=...)`` rebinds the forwards of one loaded
@@ -9,6 +9,7 @@
   and normalization (fused Triton kernels with exact PyTorch fallbacks).
 * ``"channels_last"``: additionally converts decoder convolution weights to
   channels-last memory format (faster cuDNN kernels, not bit-exact).
+* ``"cudnn"``: Blackwell cuDNN Conv3D/post-operation fusions for BF16 and FP32.
 * ``"off"``: leave the diffusers implementation untouched.
 
 The framework installs it from ``vllm_omni.diffusion.registry.initialize_model``

@@ -73,6 +73,20 @@ def downsample_forward(
     else:
         # Call the convolution module normally: its hooks/wrappers are retained.
         spatial = self.resample[1](padded)
+    return finish_downsample(self, spatial, batch, frames, feat_cache, feat_idx, channels_last=channels_last)
+
+
+def finish_downsample(
+    self: WanResample,
+    spatial: torch.Tensor,
+    batch: int,
+    frames: int,
+    feat_cache: list[Any] | None,
+    feat_idx: list[int],
+    *,
+    channels_last: bool,
+) -> torch.Tensor:
+    """Finish spatial downsampling and advance the temporal-convolution history."""
     x = fp._split_batch_and_frames(spatial, batch, frames, channels_last=channels_last)
 
     if self.mode == "downsample3d" and feat_cache is not None:

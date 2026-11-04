@@ -25,8 +25,9 @@ order exactly and only differs in how the bytes move:
   round trip is the identity and is skipped.
 
 The opt-in ``channels_last`` level also changes convolution and normalization
-arithmetic. Its first-frame causal Conv3d uses the mathematically equivalent
-Conv2d when there is no history; floating-point outputs need not be bit-exact.
+arithmetic. Eligible first-frame causal convolutions use only the last temporal
+filter plane. Strict FP32 spatial convolutions use one-plane Conv3d to avoid
+Conv2d's FFT workspace; other arithmetic policies use Conv2d.
 Whenever a kernel declines an input, the reference expression is used.
 """
 
@@ -75,7 +76,7 @@ class FastPathConfig:
     channels_last: bool = False
     clone_encoder_shortcuts: bool = False
     fuse_norm_cache: bool = False
-    # Keep the reference BF16 roundings in the channels-last norm (encoder only).
+    # Match the BF16 roundings used by encoder and cuDNN preparation kernels.
     exact_bf16_norm: bool = False
     # Lossless paths and the decoder output projection retain bitwise probes.
     verify_spatial_padding: bool = True
@@ -386,7 +387,58 @@ def _conv_verdict_key(conv: nn.Module, x: torch.Tensor, cache_frames: int) -> tu
     )
 
 
-def _first_frame_conv2d(
+def _use_first_frame_shortcut(conv: nn.Conv3d, dtype: torch.dtype) -> bool:
+    # Wide Wan 2.2 and Wan 2.1 latent-input BF16 rounding errors amplify in decode.
+    return dtype != torch.bfloat16 or (conv.out_channels < 512 and (conv.in_channels, conv.out_channels) != (16, 384))
+
+
+def _spatial_convolution(
+    image: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    stride: tuple[int, int] = (1, 1),
+    padding: tuple[int, int] = (0, 0),
+    dilation: tuple[int, int] = (1, 1),
+    groups: int = 1,
+) -> torch.Tensor:
+    """Use one-plane native Conv3D for strict FP32 to avoid Conv2D FFT workspaces."""
+    if (
+        image.is_cuda
+        and image.dtype == weight.dtype == torch.float32
+        and not torch.is_autocast_enabled("cuda")
+        and not torch.backends.cudnn.allow_tf32
+    ):
+        return (
+            F.conv3d(
+                image.unsqueeze(2).contiguous(),
+                weight.unsqueeze(2).contiguous(),
+                bias,
+                stride=(1, *stride),
+                padding=(0, *padding),
+                dilation=(1, *dilation),
+                groups=groups,
+            )
+            .squeeze(2)
+            .contiguous(memory_format=torch.channels_last)
+        )
+    return F.conv2d(image, weight, bias, stride, padding, dilation, groups)
+
+
+def spatial_conv_forward(self: nn.Conv2d, x: torch.Tensor) -> torch.Tensor:
+    """Apply the spatial policy while retaining module hooks and live parameters."""
+    cfg = getattr(self, CFG_ATTR, None)
+    if (
+        cfg is not None
+        and cfg.channels_last
+        and _kernels_allowed(x)
+        and self.padding_mode == "zeros"
+        and not isinstance(self.padding, str)
+    ):
+        return _spatial_convolution(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+    return nn.Conv2d.forward(self, x)
+
+
+def _first_frame_convolution(
     conv: WanCausalConv3d, x: torch.Tensor, bias: torch.Tensor | None
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Convolve ``[0, 0, x]`` with the last temporal weight slice, retaining the cache.
@@ -401,6 +453,7 @@ def _first_frame_conv2d(
         or not cfg.channels_last
         or x.shape[2] != 1
         or x.dtype not in _NORM_DTYPES
+        or not _use_first_frame_shortcut(conv, x.dtype)
         or conv.kernel_size not in ((3, 3, 3), (3, 1, 1))
         or conv.stride != (1, 1, 1)
         or conv.dilation != (1, 1, 1)
@@ -418,7 +471,7 @@ def _first_frame_conv2d(
     # become stale after weight loading or keep offloaded weights on the GPU.
     weight = conv.weight[:, :, 2].contiguous(memory_format=torch.channels_last)
     image = x[:, :, 0].contiguous(memory_format=torch.channels_last)
-    out = F.conv2d(image, weight, bias, padding=(conv._padding[2], conv._padding[0]))
+    out = _spatial_convolution(image, weight, bias, padding=(conv._padding[2], conv._padding[0]))
     return out.unsqueeze(2), next_cache
 
 
@@ -468,7 +521,7 @@ def _run_cached_causal_conv(
             return out, _deferred_conv_bias(conv, out) if fold_bias else None
 
         if payload is None:
-            first_frame = _first_frame_conv2d(conv, x, bias)
+            first_frame = _first_frame_convolution(conv, x, bias)
             if first_frame is not None:
                 out, cache_list[index] = first_frame
                 return with_bias(out)
@@ -791,7 +844,8 @@ def resample_forward(
         and _may_defer_conv_bias(self, x)
     ):
         upsample, conv = self.resample[0], self.resample[1]
-        x = F.conv2d(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
+        convolution = _spatial_convolution if channels_last else F.conv2d
+        x = convolution(upsample(x), conv.weight, None, conv.stride, conv.padding, conv.dilation, conv.groups)
         pending_bias = _deferred_conv_bias(conv, x)
     else:
         x = self.resample(x)
@@ -924,6 +978,18 @@ def residual_up_block_forward(
         else:
             x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx)
 
+    return _finish_residual_up_block(self, x, shortcut_source, feat_cache, feat_idx, first_chunk)
+
+
+def _finish_residual_up_block(
+    self: WanResidualUpBlock,
+    x: torch.Tensor,
+    shortcut_source: torch.Tensor,
+    feat_cache: list[Any] | None,
+    feat_idx: list[int],
+    first_chunk: bool,
+) -> torch.Tensor:
+    """Apply upsampling and the stage shortcut to either residual-chain implementation."""
     shortcut = self.avg_shortcut
     # The upsampler's Conv2d output feeds only ``x + DupUp3D(...)``, so its bias
     # is folded into that kernel (exact: rounded like ATen's ``add_`` first).

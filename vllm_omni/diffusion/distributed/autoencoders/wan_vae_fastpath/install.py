@@ -24,6 +24,7 @@ from diffusers.models.autoencoders.autoencoder_kl_wan import (
     WanResidualBlock,
     WanResidualDownBlock,
     WanResidualUpBlock,
+    WanUpBlock,
     WanUpsample,
 )
 from vllm.logger import init_logger
@@ -35,7 +36,7 @@ from . import forwards
 
 logger = init_logger(__name__)
 
-VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last")
+VAE_FAST_PATH_LEVELS: tuple[str, ...] = ("off", "lossless", "channels_last", "cudnn")
 
 REPORT_ATTR = "_vllm_omni_wan_fastpath_report"
 _UNDO_ATTR = "_vllm_omni_wan_fastpath_undo"
@@ -127,6 +128,7 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
       * ``"off"``: do nothing.
       * ``"lossless"``: bind the bit-exact replacement forwards (Tier 1).
       * ``"channels_last"``: Tier 1 plus channels-last conv weights (not bit-exact).
+      * ``"cudnn"``: channels-last with Blackwell cuDNN convolution/post-op fusions.
 
     The installer refuses (and reports why) when the VAE is not a diffusers Wan
     VAE, or when spatially-sharded decode is configured or already installed:
@@ -166,6 +168,13 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     bypassed: set[nn.Module] = set()
     for _, module in modules:
         replacement = _REPLACEMENT_FORWARDS.get(type(module))
+        if level in ("channels_last", "cudnn") and type(module) is nn.Conv2d:
+            replacement = forwards.spatial_conv_forward
+        if level == "cudnn" and type(module) is WanUpBlock:
+            from . import cudnn
+
+            if cudnn.supports_up_stage(module):
+                replacement = cudnn.up_block_forward
         if forwards.is_diffusers_rms_norm(module):
             replacement = forwards.rms_norm_forward
             bypassed.add(module)
@@ -196,6 +205,12 @@ def install_wan_vae_fastpath(vae: nn.Module, *, level: str = "lossless") -> WanV
     # Forward hooks need no check here: every inlined call site checks them at
     # runtime and then calls the module normally.
 
+    if level == "cudnn":
+        from .cudnn import availability
+
+        reason = availability(decoder)
+        if reason:
+            return _skip(level, reason)
     return _install_bindings(vae, decoder, bindings, convs, level=level)
 
 
@@ -221,11 +236,11 @@ def _install_bindings(
         )
     cfg = forwards.FastPathConfig(
         fused_silu_dtypes=fused_silu_dtypes,
-        channels_last=level == "channels_last",
+        channels_last=level in ("channels_last", "cudnn"),
         clone_encoder_shortcuts=clone_encoder_shortcuts,
         fuse_norm_cache=encoder,
-        exact_bf16_norm=encoder,
-        verify_spatial_padding=encoder or level != "channels_last",
+        exact_bf16_norm=encoder or level == "cudnn",
+        verify_spatial_padding=encoder or level not in ("channels_last", "cudnn"),
     )
     # Preserve the output projection's validated formulation. Internal decoder
     # convolutions can use implicit padding under the channels-last tolerance
@@ -253,7 +268,46 @@ def _install_bindings(
             setattr(module, forwards.CFG_ATTR, module_cfg)
             patched[type(module).__name__] = patched.get(type(module).__name__, 0) + 1
 
+        def attach_packed_weight(conv: nn.Module, *, causal: bool = False) -> None:
+            from . import cudnn
+
+            conv.add_module("_wan_cudnn_weight", cudnn.PackedWeight(causal=causal))
+            hook = conv.register_load_state_dict_post_hook(conv._wan_cudnn_weight.invalidate)
+            rollback.callback(hook.remove)
+            undo.append(hook.remove)
+            restore_packed = partial(delattr, conv, "_wan_cudnn_weight")
+            rollback.callback(restore_packed)
+            undo.append(restore_packed)
+
         for module, replacement in bindings:
+            if level == "cudnn" and type(module) is WanDecoder3d:
+                from . import cudnn
+
+                if cudnn.supports_decoder(module):
+                    replacement = cudnn.decoder_forward
+            if level == "cudnn" and type(module) is WanEncoder3d:
+                from . import cudnn
+
+                if cudnn.supports_input(module):
+                    replacement = cudnn.encoder_forward
+                    attach_packed_weight(module.conv_in, causal=True)
+            if level == "cudnn" and type(module) is WanResidualDownBlock:
+                from . import cudnn
+
+                if cudnn.supports_stage(module):
+                    replacement = cudnn.residual_down_block_forward
+            if level == "cudnn" and type(module) is WanResidualUpBlock:
+                from . import cudnn
+
+                if cudnn.supports_up_stage(module):
+                    replacement = cudnn.up_block_forward
+            if level == "cudnn" and type(module) is WanResidualBlock:
+                from . import cudnn
+
+                if cudnn.supports_block(module):
+                    replacement = cudnn.residual_block_forward
+                    for conv in (module.conv1, module.conv2):
+                        attach_packed_weight(conv)
             bind(module, replacement)
 
         if cfg.channels_last:
@@ -338,7 +392,15 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     if not isinstance(vae, AutoencoderKLWan):
         return skip(f"{type(vae).__name__} is not a diffusers AutoencoderKLWan")
     config = vae.config
-    if not (
+    wan21 = (
+        not config.is_residual
+        and config.patch_size is None
+        and config.in_channels == 3
+        and config.scale_factor_temporal == 4
+        and config.scale_factor_spatial == 8
+        and list(config.temperal_downsample) == [False, True, True]
+    )
+    if not (level == "cudnn" and wan21) and not (
         config.is_residual
         and config.patch_size == 2
         and config.in_channels == 12
@@ -350,7 +412,9 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     encoder = vae.encoder
     if type(encoder) is not WanEncoder3d or type(vae.quant_conv) is not WanCausalConv3d:
         return skip("encoder or quant_conv has an unsupported type")
-    if len(encoder.down_blocks) != 4 or any(type(block) is not WanResidualDownBlock for block in encoder.down_blocks):
+    if not wan21 and (
+        len(encoder.down_blocks) != 4 or any(type(block) is not WanResidualDownBlock for block in encoder.down_blocks)
+    ):
         return skip("requires four diffusers WanResidualDownBlock stages")
 
     replacements: dict[type[nn.Module], Callable[..., torch.Tensor]] = {
@@ -360,6 +424,16 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
         WanCausalConv3d: forwards.causal_conv_forward,
         WanResidualBlock: forwards.residual_block_forward,
     }
+    if level == "cudnn":
+        from .cudnn import availability
+
+        reason = availability(encoder)
+        if reason:
+            return skip(reason)
+    if wan21:
+        from .cudnn import flat_encoder_forward
+
+        replacements[WanEncoder3d] = flat_encoder_forward
     modules = [(f"encoder.{name}" if name else "encoder", module) for name, module in encoder.named_modules()]
     modules.append(("quant_conv", vae.quant_conv))
     bindings: list[tuple[nn.Module, Callable[..., Any]]] = []
@@ -367,6 +441,8 @@ def install_wan_vae_encoder_fastpath(vae: nn.Module, *, level: str = "lossless")
     bypassed: set[nn.Module] = set()
     for _, module in modules:
         replacement = replacements.get(type(module))
+        if level in ("channels_last", "cudnn") and type(module) is nn.Conv2d:
+            replacement = forwards.spatial_conv_forward
         if module is vae.quant_conv:
             replacement = ef.quant_conv_forward
         if forwards.is_diffusers_rms_norm(module):

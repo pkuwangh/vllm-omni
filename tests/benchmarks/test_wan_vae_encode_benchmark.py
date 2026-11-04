@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Input, validation and reporting contracts for the standalone encoder benchmark."""
 
 import itertools
@@ -23,7 +23,7 @@ def test_benchmark_reference_always_runs_first(monkeypatch):
     args = parse_args()
     assert args.levels == ["off", "channels_last", "lossless"]
     assert args.warmup == 3 and args.iters == 10
-    assert args.schedule == "interleaved" and args.telemetry_interval_ms == 50 and args.lock_sm_clock_mhz is None
+    assert args.schedule == "sequential" and args.telemetry_interval_ms == 50 and args.lock_sm_clock_mhz is None
 
 
 @pytest.mark.parametrize(
@@ -95,7 +95,8 @@ def test_lossless_failure_identifies_every_tensor_and_keeps_timings():
 
 @pytest.mark.parametrize("dtype,limit", [(torch.bfloat16, 0.02), (torch.float16, 0.01), (torch.float32, 0.01)])
 @pytest.mark.parametrize("case", ["below", "boundary", "above"])
-def test_channels_last_threshold_and_error_precision(monkeypatch, dtype, limit, case):
+@pytest.mark.parametrize("level", ["channels_last", "cudnn"])
+def test_channels_last_threshold_and_error_precision(monkeypatch, dtype, limit, case, level):
     nrmse = {"below": limit / 2, "boundary": limit, "above": math.nextafter(limit, 1.0)}[case]
     failed = case == "above"
     monkeypatch.setattr(
@@ -103,12 +104,20 @@ def test_channels_last_threshold_and_error_precision(monkeypatch, dtype, limit, 
         "differences",
         lambda *_: dict(bitwise_equal=False, max_abs_diff=0.02, normalized_rmse=nrmse),
     )
-    result = _result("channels_last", dtype=dtype)
+    result = _result(level, dtype=dtype)
     benchmark.validate_result(result, _result("off", dtype=dtype))
     assert result[0]["status"] == ("validation_failed" if failed else "ok")
     assert bool(result[0]["errors"]) is failed
     if failed:
         assert f"normalized_rmse={nrmse!r} exceeds {limit:g} ({limit:.0%})" in result[0]["errors"][0]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_cudnn_fp32_gate_respects_tf32_permission(strict):
+    result = _result("cudnn", value=1.001)
+    result[0]["strict_fp32"] = strict
+    benchmark.validate_result(result, _result("off"))
+    assert result[0]["status"] == ("validation_failed" if strict else "ok")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -331,7 +340,7 @@ def cpu_rounds(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "reset_peak_memory_stats", lambda: None)
     monkeypatch.setattr(torch.accelerator, "max_memory_allocated", lambda: 1000)
     monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
-    calls = []
+    calls: list[str] = []
 
     def make(fail_at=None):
         return [

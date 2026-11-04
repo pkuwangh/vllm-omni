@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+import sys
 from collections.abc import Callable
 from functools import wraps
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -69,6 +71,29 @@ def _build_pair(config: dict, dtype: torch.dtype) -> tuple[AutoencoderKLWan, Aut
     candidate = AutoencoderKLWan(**config).eval().to(dtype)
     candidate.load_state_dict(reference.state_dict())
     return reference, candidate
+
+
+@pytest.mark.parametrize("version", ["4.8.0", "4.9.0a0", "4.9.0", "5.0.0"])
+def test_cudnn_provider_checks_dsl_version(monkeypatch: pytest.MonkeyPatch, version: str) -> None:
+    from vllm_omni.diffusion.distributed.autoencoders.wan_vae_fastpath import cudnn
+
+    frontend = ModuleType("cudnn")
+
+    def pack(weight: torch.Tensor, *, allow_tf32: bool = False) -> torch.Tensor:
+        return weight
+
+    monkeypatch.setattr(frontend, "pack_conv3d_weight_sm100", pack, raising=False)
+    monkeypatch.setitem(sys.modules, "cudnn", frontend)
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: version)
+    cudnn.provider.cache_clear()
+    try:
+        if version == "4.8.0":
+            with pytest.raises(ImportError, match="CUTLASS DSL >= 4.9"):
+                cudnn.provider()
+        else:
+            assert cudnn.provider() is frontend
+    finally:
+        cudnn.provider.cache_clear()
 
 
 @pytest.mark.parametrize("config_name", sorted(CONFIGS))

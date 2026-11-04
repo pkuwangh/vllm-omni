@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark Cosmos3's Wan encoder against the reference on H100/GB200.
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Benchmark Wan 2.1/2.2 encoder fast paths against the reference.
 
 Examples::
 
@@ -16,15 +16,12 @@ The default input is seeded uniform noise. The reference is always set up and
 validated first. Console output uses timing and quality tables; ``--json``
 saves full metrics and per-level failure reasons.
 
-GPU clocks depend on the thermal and power history, and power-limited boards
-(H100 NVL, RTX 5090, RTX PRO 6000) clock the same kernels down by more than 2x
-under sustained load. By default (``--schedule interleaved``) every level's VAE
-stays resident and one encode per level runs in each round, with the first
-level rotating from round to round, so all levels are timed under the same
-conditions. ``--schedule sequential`` times one level after another, loading
-one VAE at a time. NVML samples SM clock, power, temperature and clock-event
-(throttle) reasons during timed encodes; ``--lock-sm-clock-mhz`` pins the SM
-clock (requires administrator rights) and restores the default on exit.
+Each level is warmed and timed consecutively by default (``--schedule sequential``).
+This lets its power/clock state settle before sampling. ``--schedule interleaved``
+keeps all VAEs resident and rotates levels, but switching implementations can
+carry a different power state into the next sample. NVML reports clocks, power,
+temperature and clock-event reasons during timed encodes. ``--lock-sm-clock-mhz``
+pins the SM clock and restores the default on exit (requires administrator rights).
 """
 
 from __future__ import annotations
@@ -105,11 +102,13 @@ def parse_args():
     parser.add_argument("--frames", type=int, default=93)
     parser.add_argument("--input", type=Path, help="Preprocessed RGB .pt tensor; overrides size/frames")
     parser.add_argument("--dtype", choices=DTYPES, default="bf16")
-    parser.add_argument("--fast-path", default=",".join(VAE_FAST_PATH_LEVELS))
+    parser.add_argument("--fast-path", default="off,lossless,channels_last")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tf32", choices=("on", "off"), default="on")
+    parser.add_argument(
+        "--tf32", choices=("on", "off"), default="on", help="convolution TF32 permission for all candidates"
+    )
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--profile-rows", type=int, default=30)
     parser.add_argument("--check-reconstruction", action="store_true", help="Require reference-decode PSNR >= 50 dB")
@@ -119,8 +118,8 @@ def parse_args():
     parser.add_argument(
         "--schedule",
         choices=SCHEDULES,
-        default="interleaved",
-        help="interleaved: all levels resident, timed round-robin (default); sequential: one level at a time",
+        default="sequential",
+        help="sequential: warm and time one level at a time (default); interleaved: all levels resident, round-robin",
     )
     parser.add_argument(
         "--telemetry-interval-ms",
@@ -418,8 +417,12 @@ def validate_result(result, reference):
                 f"[{level}] {name}: bitwise_equal=False, required True "
                 f"(max_abs_diff={max_abs:.6g}, normalized_rmse={nrmse!r})."
             )
+        if level == "cudnn" and stats.get("strict_fp32", False):
+            metrics["allclose"] = torch.allclose(actual, expected, atol=1e-4, rtol=1e-4)
+            if not metrics["allclose"]:
+                errors.append(f"[{level}] {name}: strict FP32 exceeds atol=rtol=1e-4.")
         limit = encoder_nrmse_limit(actual.dtype)
-        if level == "channels_last" and math.isfinite(nrmse) and nrmse > limit:
+        if level in ("channels_last", "cudnn") and math.isfinite(nrmse) and nrmse > limit:
             errors.append(
                 f"[{level}] {name}: normalized_rmse={nrmse!r} exceeds "
                 f"{limit:g} ({limit:.0%}); max_abs_diff={max_abs:.6g}."
@@ -499,7 +502,7 @@ def _print_telemetry(results, environment):
         if spread > CLOCK_SPREAD_WARNING:
             print(
                 f"Warning: median SM clocks differ by {spread:.0%} across levels, so the speedups include "
-                "clock differences. Use --schedule interleaved or --lock-sm-clock-mhz for comparable timings."
+                "clock differences. Check per-iteration telemetry and allow enough warmup for each level."
             )
     if throttled:
         print(
@@ -552,7 +555,7 @@ def print_results(results, environment):
                     ]
                 )
     if rows:
-        print("\nPosterior quality vs. off (NRMSE is normalized RMSE; bitwise 'no' is allowed for channels_last)")
+        print("\nPosterior quality vs. off (NRMSE is normalized RMSE; bitwise 'no' is allowed for approximate levels)")
         _print_table(["Level", "Tensor", "Bitwise", "Max abs diff", "NRMSE"], rows)
     rows = [
         [stats["level"], f"{float(stats['reconstruction_psnr_db']):.2f}"]
@@ -564,7 +567,7 @@ def print_results(results, environment):
         _print_table(["Level", "PSNR (dB)"], rows, text_columns=1)
     print(
         "\nGates: lossless must be bitwise equal; "
-        f"channels_last NRMSE <= {encoder_nrmse_limit(torch.bfloat16):.0%} for BF16, "
+        f"channels_last/cudnn NRMSE <= {encoder_nrmse_limit(torch.bfloat16):.0%} for BF16, "
         f"{encoder_nrmse_limit(torch.float32):.0%} for FP16/FP32; "
         "posterior comparison metrics must be finite."
     )
@@ -692,8 +695,8 @@ def _timed_encode(args, run: LevelRun, telemetry: GpuTelemetry | None, iteration
 def run_rounds(args, runs: list[LevelRun], telemetry: GpuTelemetry | None = None, *, fail_fast: bool = True):
     """Warm up, then time, every level round-robin, rotating the first level each round.
 
-    Rotation puts every level in every position of the order, so no level
-    systematically follows a heavier one or runs later on a hotter GPU.
+    Rotation balances positions, but not predecessor power states. Use the
+    sequential schedule for consecutive samples after each level's own warmup.
     Returns ``{level: OutOfMemoryError}`` for levels dropped after running out
     of memory; with ``fail_fast`` the first such error is raised instead.
     """
@@ -739,6 +742,12 @@ def finish_level(args, run: LevelRun, rank, telemetry: GpuTelemetry | None = Non
             level=level,
             install_s=run.install_s,
             first_call_s=run.first_call_s,
+            packed_weight_bytes=(
+                sum(b.numel() * b.element_size() for n, b in vae.named_buffers() if "_wan_cudnn_weight" in n)
+                if level == "cudnn"
+                else 0
+            ),
+            strict_fp32=args.dtype == "fp32" and args.tf32 == "off",
             median_s=median,
             min_s=min(run.times),
             times_s=run.times,
@@ -882,9 +891,10 @@ def package_version(name):
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
-        raise SystemExit("CUDA is required; use H100 or GB200 for target performance validation")
+        raise SystemExit("CUDA is required; the cudnn level requires SM100 or SM103")
     rank = distributed_setup(args)
     torch.backends.cudnn.allow_tf32 = args.tf32 == "on"
+    torch.backends.cuda.matmul.allow_tf32 = False
     pixels = make_pixels(args)
     results = []
     reference = None
@@ -910,6 +920,7 @@ def main():
         input=str(args.input) if args.input else "seeded_uniform",
         seed=args.seed,
         tf32=args.tf32,
+        matmul_tf32=torch.backends.cuda.matmul.allow_tf32,
         cudnn_benchmark=torch.backends.cudnn.benchmark,
         deterministic=torch.are_deterministic_algorithms_enabled(),
         world_size=args.vae_patch_parallel_size,
